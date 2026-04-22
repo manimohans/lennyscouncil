@@ -1,0 +1,42 @@
+{
+	"name": "lennys-council",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "bun --env-file=.env.local --bun vite dev",
+		"build": "bun --env-file=.env.local --bun vite build",
+		"preview": "bun --env-file=.env.local --bun vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"preflight": "bun --env-file=.env.local scripts/preflight.ts",
+		"migrate": "bun --env-file=.env.local scripts/migrate.ts",
+		"ingest": "bun --env-file=.env.local scripts/ingest.ts",
+		"build-experts": "bun --env-file=.env.local scripts/build-expert-profiles.ts",
+		"enrich-experts": "bun --env-file=.env.local scripts/enrich-experts.ts",
+		"smoke-roundtable": "bun --env-file=.env.local scripts/smoke-roundtable.ts"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-auto": "^7.0.1",
+		"@sveltejs/kit": "^2.57.0",
+		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"@tailwindcss/typography": "^0.5.19",
+		"@tailwindcss/vite": "^4.2.4",
+		"gray-matter": "^4.0.3",
+		"svelte": "^5.55.2",
+		"svelte-check": "^4.4.6",
+		"tailwindcss": "^4.2.4",
+		"typescript": "^6.0.2",
+		"vite": "^8.0.7",
+		"zod": "^4.3.6"
+	},
+	"dependencies": {
+		"@supabase/ssr": "^0.10.2",
+		"@supabase/supabase-js": "^2.104.0",
+		"date-fns": "^4.1.0",
+		"dompurify": "^3.4.1",
+		"marked": "^18.0.2",
+		"postgres": "^3.4.9"
+	}
+}

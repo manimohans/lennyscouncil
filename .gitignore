@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+.output/
+.vercel/
+.netlify/
+.wrangler/
+**/.svelte-kit/
+**/build/
+
+# Env (never commit secrets)
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite timestamps
+**/vite.config.js.timestamp-*
+**/vite.config.ts.timestamp-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Claude / local tooling
+.claude/
+.playwright-mcp/
+
+# Test / design artifacts at repo root
+/baseline-*.png
+/final-*.png
+/redesign-*.png
+/*.png
+
+# External corpus data (separate upstream repo)
+lennys-newsletterpodcastdata-all/
+
+# Logs
+*.log
+npm-debug.log*
+bun-debug.log*
