@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import LogoMark from './LogoMark.svelte';
 	let {
 		user,
 		recentChats = []
@@ -26,11 +27,13 @@
 >
 	<a
 		href="/"
-		class="block border-b border-[var(--color-line)] px-3 py-3 font-mono text-sm font-semibold tracking-tight"
+		class="flex items-center gap-2 border-b border-[var(--color-line)] px-3 py-3 font-mono text-sm font-semibold tracking-tight"
 	>
-		<span class="text-[var(--color-accent)]">$</span>
-		<span class="text-[var(--color-text)]">lenny's</span>
-		<span class="text-[var(--color-accent-hi)]">council</span>
+		<span class="text-[var(--color-accent)]"><LogoMark size={18} /></span>
+		<span>
+			<span class="text-[var(--color-text)]">lenny's</span>
+			<span class="text-[var(--color-accent-hi)]">council</span>
+		</span>
 	</a>
 
 	<div class="flex-1 overflow-y-auto">

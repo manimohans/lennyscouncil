@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import LogoMark from './LogoMark.svelte';
 
 	const modes = [
 		{ href: '/roundtable', label: 'rt' },
@@ -18,8 +19,8 @@
 <header
 	class="sticky top-0 z-10 flex items-center gap-3 border-b border-[var(--color-line)] bg-[var(--color-panel)]/95 px-3 py-2 backdrop-blur lg:hidden"
 >
-	<a href="/" class="font-mono text-sm font-semibold tracking-tight shrink-0">
-		<span class="text-[var(--color-accent)]">$</span>
+	<a href="/" class="flex items-center gap-1.5 font-mono text-sm font-semibold tracking-tight shrink-0">
+		<span class="text-[var(--color-accent)]"><LogoMark size={16} /></span>
 		<span class="text-[var(--color-accent-hi)]">council</span>
 	</a>
 	<nav class="flex flex-1 items-center gap-1 overflow-x-auto">
