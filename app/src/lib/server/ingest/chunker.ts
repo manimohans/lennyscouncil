@@ -9,6 +9,7 @@ export interface ChunkInput {
 	date: string;
 	tags: string[];
 	text: string;
+	source_url?: string;
 	timestamp_str?: string;
 	heading_trail?: string;
 }
@@ -118,6 +119,7 @@ interface PodcastFrontmatter {
 	date: string;
 	tags: string[];
 	guest: string;
+	youtube_url?: string;
 }
 
 export function chunkPodcast(
@@ -184,6 +186,7 @@ export function chunkPodcast(
 					date: fm.date,
 					tags: fm.tags,
 					text: pieces[pi],
+					source_url: fm.youtube_url,
 					timestamp_str: t.timestamp
 						? pieces.length > 1
 							? `${t.timestamp}+${pi}`
@@ -201,6 +204,7 @@ interface NewsletterFrontmatter {
 	title: string;
 	date: string;
 	tags: string[];
+	post_url?: string;
 }
 
 interface HeadingSection {
@@ -299,6 +303,7 @@ export function chunkNewsletter(
 					date: fm.date,
 					tags: fm.tags,
 					text: pieces[i],
+					source_url: fm.post_url,
 					heading_trail: `(part ${i + 1}/${pieces.length})`
 				})
 			);
@@ -318,6 +323,7 @@ export function chunkNewsletter(
 					date: fm.date,
 					tags: fm.tags,
 					text: pieces[i],
+					source_url: fm.post_url,
 					heading_trail:
 						pieces.length > 1
 							? `${section.trail || '(intro)'} (part ${i + 1}/${pieces.length})`

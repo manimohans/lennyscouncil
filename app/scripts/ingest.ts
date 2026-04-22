@@ -62,11 +62,13 @@ interface FrontmatterPodcast {
 	date: string;
 	tags: string[];
 	guest: string;
+	youtube_url?: string;
 }
 interface FrontmatterNewsletter {
 	title: string;
 	date: string;
 	tags: string[];
+	post_url?: string;
 }
 
 function parseFile(file: FileTask, raw: string): Chunk[] {
@@ -79,14 +81,16 @@ function parseFile(file: FileTask, raw: string): Chunk[] {
 			title: String(fm.title ?? ''),
 			date: String(fm.date ?? '1970-01-01'),
 			tags: Array.isArray(fm.tags) ? (fm.tags as string[]) : [],
-			guest: String(fm.guest ?? '')
+			guest: String(fm.guest ?? ''),
+			youtube_url: typeof fm.youtube_url === 'string' ? fm.youtube_url : undefined
 		};
 		return chunkPodcast(relPath, parsed.content, pfm);
 	}
 	const nfm: FrontmatterNewsletter = {
 		title: String(fm.title ?? ''),
 		date: String(fm.date ?? '1970-01-01'),
-		tags: Array.isArray(fm.tags) ? (fm.tags as string[]) : []
+		tags: Array.isArray(fm.tags) ? (fm.tags as string[]) : [],
+		post_url: typeof fm.post_url === 'string' ? fm.post_url : undefined
 	};
 	return chunkNewsletter(relPath, parsed.content, nfm);
 }
@@ -123,11 +127,21 @@ async function insertBatch(rows: Array<Chunk & { embedding: number[] }>) {
 		token_count: r.token_count,
 		content_hash: r.content_hash,
 		timestamp_str: r.timestamp_str ?? null,
-		heading_trail: r.heading_trail ?? null
+		heading_trail: r.heading_trail ?? null,
+		source_url: r.source_url ?? null
 	}));
 	const result = await sql`
 		INSERT INTO chunks ${sql(values)}
 		ON CONFLICT (content_hash) DO NOTHING
+	`;
+	// Attach speaker_id (FK to experts) for rows just inserted. Safe to run
+	// every batch — `WHERE speaker_id IS NULL` scopes the work to new rows.
+	await sql`
+		UPDATE chunks c
+		   SET speaker_id = e.id
+		  FROM experts e
+		 WHERE c.speaker_id IS NULL
+		   AND e.name = c.speaker
 	`;
 	return result.count;
 }
@@ -189,6 +203,12 @@ async function main() {
 		count: number;
 	}>;
 	console.log(`  total in DB:      ${count}`);
+
+	// Refresh planner stats so HNSW + tsv queries get accurate cost estimates.
+	// Fresh-ingest autovacuum can take minutes; this is deterministic.
+	process.stdout.write('  ANALYZE chunks... ');
+	await sql`ANALYZE chunks`;
+	console.log('done.');
 
 	await sql.end();
 }

@@ -12,6 +12,7 @@
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"preflight": "bun --env-file=.env.local scripts/preflight.ts",
 		"migrate": "bun --env-file=.env.local scripts/migrate.ts",
+		"backfill-urls": "bun --env-file=.env.local scripts/backfill-source-urls.ts",
 		"ingest": "bun --env-file=.env.local scripts/ingest.ts",
 		"build-experts": "bun --env-file=.env.local scripts/build-expert-profiles.ts",
 		"enrich-experts": "bun --env-file=.env.local scripts/enrich-experts.ts",
@@ -36,6 +37,7 @@
 		"@supabase/supabase-js": "^2.104.0",
 		"date-fns": "^4.1.0",
 		"dompurify": "^3.4.1",
+		"isomorphic-dompurify": "^2.16.0",
 		"marked": "^18.0.2",
 		"postgres": "^3.4.9"
 	}
