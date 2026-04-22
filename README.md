@@ -22,9 +22,11 @@ Ask a product question. The system picks the experts who actually spoke on that 
 
 Most AI "expert" apps do one of two things. They invent a persona and guess, or they bolt RAG onto a single LLM and call it a day. Neither produces the thing you actually want: a conversation among people who *already disagreed in public* about the exact problem you're working on.
 
-Lenny Rachitsky has spent years getting the best PMs, founders, and operators to say what they actually think, on the record. **295 podcast episodes. 349 newsletter essays. Thousands of hours of transcripts with the speaker of every sentence tagged.** That archive is a product manager's dream corpus, and it's sitting there.
+Lenny Rachitsky has spent years getting the best PMs, founders, and operators to say what they actually think, on the record. **295 podcast episodes. 349 newsletter essays. Thousands of hours of transcripts with the speaker of every sentence tagged.** That archive is a product manager's dream corpus.
 
 Lenny's Council turns it into a working advisory board. Pick a mode, drop in your question, and the system picks experts who have real receipts on the topic, then runs them against each other for three to five rounds. Every claim is a click away from the chunk where the person said it.
+
+> **You need a [Lenny's Data](https://lennysdata.com) subscription to run this.** The transcripts and newsletter text are paid content — subscribers get them through lennysdata.com. This repo ships the pipeline and the UI; it never ships the corpus. Without a subscription, everything boots but every query returns empty.
 
 **This is not a roundtable app.** The Roundtable is the hero mode, but there are six different ways to use the same grounded-expert engine — panel review of a PRD, idea validation, a 1:1 career mentor, a strategy advisor, and a gap scanner that mines the corpus for unsolved problems.
 
@@ -110,7 +112,7 @@ Every `[c:N]` opens the exact chunk — timestamped, speaker-attributed, a click
   ollama pull nomic-embed-text
   ollama pull kimi-k2.6:cloud
   ```
-- The corpus — clone [`lennys-newsletterpodcastdata-all`](https://github.com/manimohans/lennys-newsletterpodcastdata-all) as a sibling directory of this repo
+- **The corpus — requires a [Lenny's Data](https://lennysdata.com) subscription.** Transcripts and newsletter text are gated content; this repo does not (and cannot) redistribute them. Subscribers export their transcript archive into a sibling directory of this repo (`CORPUS_PATH` defaults to `../lennys-newsletterpodcastdata-all`). Without a subscription there's nothing to ingest — the UI will still boot, but every query returns empty.
 
 ### Bring it up
 
@@ -200,9 +202,9 @@ bun run dev
 
 ## The corpus
 
-Not in this repo. Pull [`manimohans/lennys-newsletterpodcastdata-all`](https://github.com/manimohans/lennys-newsletterpodcastdata-all) as a sibling directory — `CORPUS_PATH` defaults to `../lennys-newsletterpodcastdata-all`.
+**You need a [Lenny's Data](https://lennysdata.com) subscription to run this.** The podcast transcripts and newsletter archive are paid content, distributed to subscribers through lennysdata.com. This repo ships the pipeline, not the data — nothing in `lennys-newsletterpodcastdata-all/` is in git, and it shouldn't be.
 
-After ingestion you'll have:
+If you're a subscriber, export your archive into a sibling directory of this repo. The ingest script reads from whatever `CORPUS_PATH` points to (default `../lennys-newsletterpodcastdata-all`). After ingestion you'll have:
 
 | What | Count |
 |---|---|
@@ -269,7 +271,7 @@ Set it as `OLLAMA_BASE_URL` in `.env.local`. The IP changes per WSL boot — reg
 ## Credits
 
 - The corpus — [Lenny Rachitsky](https://www.lennyspodcast.com) and every guest whose recorded words made this possible.
-- Dataset assembly — [`lennys-newsletterpodcastdata-all`](https://github.com/manimohans/lennys-newsletterpodcastdata-all).
+- Transcripts and newsletter archive — distributed to subscribers through [Lenny's Data](https://lennysdata.com). Subscription required; this project does not redistribute any of it.
 - Retrieval fusion — Cormack, Clarke & Büttcher, *Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods* (SIGIR 2009).
 
 ---
