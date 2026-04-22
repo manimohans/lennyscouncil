@@ -1,11 +1,21 @@
 import { error } from '@sveltejs/kit';
 import { z } from 'zod';
 import type { RequestHandler } from './$types';
-import { runSingleExpertChat } from '$lib/server/orchestration/single-expert-chat';
+import {
+	runSingleExpertChat,
+	type SingleExpertEvent
+} from '$lib/server/orchestration/single-expert-chat';
+import { resolveModel } from '$lib/server/model-allowlist';
+import { sseResponse } from '$lib/server/sse';
 
 const schema = z.object({
 	mode: z.enum(['mentor', 'strategy']),
-	expertSlug: z.string().min(1),
+	expertSlug: z
+		.string()
+		.min(1)
+		.max(120)
+		// slugs are a-z0-9 + dash only — the route regex is lenient so we harden here
+		.regex(/^[a-z0-9-]+$/, 'invalid expert slug'),
 	question: z.string().min(3).max(4000),
 	chatId: z.string().uuid().nullish(),
 	model: z.string().min(1).max(100).nullish()
@@ -21,48 +31,19 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	const parsed = schema.safeParse(body);
 	if (!parsed.success) throw error(400, parsed.error.message);
 
-	const encoder = new TextEncoder();
-	const stream = new ReadableStream({
-		async start(controller) {
-			let clientAlive = true;
-			const send = (event: string, data: unknown) => {
-				if (!clientAlive) return;
-				try {
-					controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-				} catch {
-					clientAlive = false;
-				}
-			};
-			try {
-				for await (const ev of runSingleExpertChat({
-					userId: locals.user.id,
-					mode: parsed.data.mode,
-					expertSlug: parsed.data.expertSlug,
-					question: parsed.data.question,
-					chatId: parsed.data.chatId ?? undefined,
-					model: parsed.data.model ?? undefined
-				})) {
-					send(ev.kind, ev);
-				}
-				send('done', {});
-			} catch (err) {
-				send('error', { message: err instanceof Error ? err.message : String(err) });
-			} finally {
-				try {
-					controller.close();
-				} catch {
-					/* already closed */
-				}
-			}
-		}
+	const model = await resolveModel(parsed.data.model);
+
+	const generator: AsyncIterable<SingleExpertEvent> = runSingleExpertChat({
+		userId: locals.user.id,
+		mode: parsed.data.mode,
+		expertSlug: parsed.data.expertSlug,
+		question: parsed.data.question,
+		chatId: parsed.data.chatId ?? undefined,
+		model
 	});
 
-	return new Response(stream, {
-		headers: {
-			'Content-Type': 'text/event-stream',
-			'Cache-Control': 'no-cache',
-			Connection: 'keep-alive',
-			'X-Accel-Buffering': 'no'
-		}
+	return sseResponse(generator as unknown as AsyncIterable<{ kind: string }>, {
+		logLabel: `[api/expert-chat/stream:${parsed.data.mode}]`,
+		clientErrorMessage: 'The chat hit an error. Try again.'
 	});
 };

@@ -1,11 +1,19 @@
 import { sql } from '../db';
 import { OllamaClient, MODELS, type OllamaChatEvent } from '../ollama';
-import { selectExperts, type SelectedExpert } from '../expert-selector';
+import { selectExpertsWithEmbedding, type SelectedExpert } from '../expert-selector';
 import { hybridSearch, type RetrievedChunk } from '../retrieval';
 import {
 	buildExpertSystemPrompt,
 	buildModeratorSynthesisPrompt
 } from '../persona-prompt';
+import {
+	autoTitle,
+	deriveCitationIds,
+	materializeCitations,
+	persistTurn,
+	sanitizeModelOutput,
+	type CitationRef
+} from './shared';
 
 const ollamaBase = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434';
 const ollama = new OllamaClient({
@@ -14,7 +22,7 @@ const ollama = new OllamaClient({
 });
 
 export const DEFAULT_ROUNDS = 3;
-export const MIN_ROUNDS = 3;
+export const MIN_ROUNDS = 2;
 export const MAX_ROUNDS = 5;
 
 export type RoundtableEvent =
@@ -37,7 +45,7 @@ export type RoundtableEvent =
 			content: string;
 			thinking: string;
 			messageId?: string;
-			citations?: Array<{ chunk_id: number }>;
+			citations: CitationRef[];
 	  }
 	| { kind: 'session_complete'; chatId: string }
 	| { kind: 'error'; message: string };
@@ -71,18 +79,6 @@ async function loadExpertProfiles(ids: string[]): Promise<Map<string, ExpertProf
 	return new Map(rows.map((r) => [r.id, r]));
 }
 
-function deriveCitations(content: string): Array<{ chunk_id: number }> {
-	const ids = new Set<number>();
-	for (const m of content.matchAll(/\[c:(\d+)\]/g)) ids.add(Number.parseInt(m[1]));
-	return [...ids].map((chunk_id) => ({ chunk_id }));
-}
-
-function autoTitle(question: string): string {
-	const firstLine = question.split('\n')[0].trim();
-	if (firstLine.length <= 80) return firstLine;
-	return firstLine.slice(0, 77) + '…';
-}
-
 async function ensureChat(opts: {
 	userId: string;
 	chatId?: string;
@@ -94,59 +90,18 @@ async function ensureChat(opts: {
 	const rows = (await sql`
 		INSERT INTO chats (user_id, mode, title, metadata)
 		VALUES (${opts.userId}, 'roundtable', ${autoTitle(opts.question)},
-		        ${sql.json({ model: opts.model, rounds: opts.rounds })})
+		        ${sql.json({ model: opts.model, rounds: opts.rounds, question: opts.question })})
 		RETURNING id
 	`) as unknown as Array<{ id: string }>;
 	return rows[0].id;
-}
-
-async function persistTurn(input: {
-	chatId: string;
-	role: 'user' | 'expert' | 'synthesis';
-	expertId?: string;
-	content: string;
-	thinking?: string;
-	round: number;
-	turnNumber: number;
-	citations?: Array<{ chunk_id: number }>;
-}): Promise<string> {
-	const rows = (await sql`
-		INSERT INTO messages (chat_id, role, expert_id, content, thinking, round, turn_number)
-		VALUES (
-			${input.chatId}, ${input.role}, ${input.expertId ?? null},
-			${input.content}, ${input.thinking ?? null}, ${input.round}, ${input.turnNumber}
-		)
-		RETURNING id
-	`) as unknown as Array<{ id: string }>;
-	const messageId = rows[0].id;
-
-	const citations = input.citations ?? [];
-	if (citations.length > 0) {
-		const chunkIds = citations.map((c) => c.chunk_id);
-		const chunkRows = (await sql`
-			SELECT id, text, timestamp_str FROM chunks WHERE id = ANY(${chunkIds})
-		`) as unknown as Array<{ id: number | string; text: string; timestamp_str: string | null }>;
-		const byId = new Map(chunkRows.map((c) => [Number(c.id), c]));
-		const inserts = chunkIds
-			.map((cid) => byId.get(cid))
-			.filter((c): c is { id: number | string; text: string; timestamp_str: string | null } => Boolean(c))
-			.map((c) => ({
-				message_id: messageId,
-				chunk_id: Number(c.id),
-				quote: c.text.slice(0, 400),
-				timestamp_str: c.timestamp_str ?? null
-			}));
-		if (inserts.length > 0) await sql`INSERT INTO citations ${sql(inserts)}`;
-	}
-
-	await sql`UPDATE chats SET last_active_at = now() WHERE id = ${input.chatId}`;
-	return messageId;
 }
 
 interface ExpertContext {
 	selected: SelectedExpert;
 	profile: ExpertProfileRow;
 	chunks: RetrievedChunk[];
+	/** Chunks the expert sees, keyed for fast lookup during citation materialization. */
+	chunkPool: RetrievedChunk[];
 }
 
 export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator<RoundtableEvent> {
@@ -166,9 +121,23 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 		// before any LLM calls have started.
 		yield { kind: 'chat_created', chatId };
 
-		const selected =
-			opts.expertOverride ??
-			(await selectExperts(opts.question, { topK: opts.maxExperts ?? 4, excludeHosts: true }));
+		// Select experts (or accept override from UI) — reusing the embedding
+		// the selector computed, so we don't embed the query twice.
+		let selected: SelectedExpert[];
+		let embedding: number[];
+		if (opts.expertOverride && opts.expertOverride.length > 0) {
+			selected = opts.expertOverride;
+			// Still need an embedding for per-speaker retrieval below.
+			const result = await selectExpertsWithEmbedding(opts.question, { topK: 0 });
+			embedding = result.embedding;
+		} else {
+			const result = await selectExpertsWithEmbedding(opts.question, {
+				topK: opts.maxExperts ?? 4,
+				excludeHosts: true
+			});
+			selected = result.experts;
+			embedding = result.embedding;
+		}
 
 		if (selected.length === 0) {
 			yield {
@@ -182,16 +151,27 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 		yield { kind: 'experts_selected', experts: selected };
 
 		const profiles = await loadExpertProfiles(selected.map((s) => s.expert_id));
-		const allChunks = await hybridSearch(opts.question, { matchCount: 80 });
 
+		// Retrieve per-expert at the SQL layer (no more client-side speaker filter
+		// that silently dropped chunks when the top-80 was dominated by other guests).
 		const expertContexts: ExpertContext[] = [];
 		for (const s of selected) {
 			const profile = profiles.get(s.expert_id);
 			if (!profile) continue;
-			const speakerChunks = allChunks.filter((c) => c.speaker === s.name).slice(0, 6);
-			expertContexts.push({ selected: s, profile, chunks: speakerChunks });
+			const expertChunks = await hybridSearch(opts.question, {
+				matchCount: 8,
+				speakerIds: [s.expert_id],
+				embedding
+			});
+			expertContexts.push({
+				selected: s,
+				profile,
+				chunks: expertChunks,
+				chunkPool: expertChunks
+			});
 		}
 
+		// Persist the user question first so partial transcripts survive a crash.
 		await persistTurn({
 			chatId,
 			role: 'user',
@@ -202,11 +182,8 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 
 		const fullTranscript: Array<{ speakerName: string; round: number; content: string }> = [];
 		let turnNumber = 1;
-
-		// Expert rounds — every speaker sees ALL prior turns (across rounds AND
-		// earlier speakers in the current round), so a true conversation builds.
-		// The very first speaker in round 1 sees nothing and gives a cold take.
 		let consecutiveEmpty = 0;
+
 		for (let round = 1; round <= rounds; round++) {
 			for (const ctx of expertContexts) {
 				yield {
@@ -224,12 +201,15 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 					groundingChunks: ctx.chunks,
 					priorTurns: fullTranscript.slice(),
 					round,
-					totalRounds: rounds
+					totalRounds: rounds,
+					otherExperts: expertContexts
+						.filter((c) => c.profile.id !== ctx.profile.id)
+						.map((c) => c.profile.name)
 				});
 				const userPrompt =
 					fullTranscript.length === 0
 						? opts.question
-						: 'Continue the conversation. Either respond to specific points other experts raised, or sharpen your own POV — whichever is most useful to the user.';
+						: 'Continue the conversation. Either respond to specific points other experts raised (naming them) or sharpen your own POV — whichever is most useful to the user.';
 				let content = '';
 				let thinking = '';
 				for await (const ev of streamExpert(model, sys, userPrompt)) {
@@ -241,15 +221,14 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 						yield ev;
 					}
 				}
+				content = sanitizeModelOutput(content);
 
-				// Detect silent failure (model returned no content at all). After 2
-				// in a row we abort the whole roundtable rather than waste cycles.
 				if (content.trim().length === 0) {
 					consecutiveEmpty++;
 					if (consecutiveEmpty >= 2) {
 						yield {
 							kind: 'error',
-							message: `Model "${model}" returned empty responses for ${consecutiveEmpty} consecutive turns. This usually means the model was throttled, hit a quota, or doesn't support \`think: true\`. Try switching to a different model in the top-right picker (kimi-k2.6:cloud is recommended).`
+							message: `Model returned empty responses for ${consecutiveEmpty} consecutive turns. Try switching to a different model in the top-right picker.`
 						};
 						return;
 					}
@@ -257,7 +236,8 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 					consecutiveEmpty = 0;
 				}
 
-				const citations = deriveCitations(content);
+				const citedIds = deriveCitationIds(content);
+				const citations = materializeCitations(citedIds, ctx.chunkPool);
 				const messageId = await persistTurn({
 					chatId,
 					role: 'expert',
@@ -268,13 +248,21 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 					turnNumber,
 					citations
 				});
-				yield { kind: 'turn_end', expertId: ctx.profile.id, content, thinking, messageId, citations };
+				yield {
+					kind: 'turn_end',
+					expertId: ctx.profile.id,
+					content,
+					thinking,
+					messageId,
+					citations
+				};
 				fullTranscript.push({ speakerName: ctx.profile.name, round, content });
 				turnNumber++;
 			}
 		}
 
-		// Synthesis
+		// Synthesis — the moderator sees every chunk from every expert so it
+		// can cite any of them.
 		yield {
 			kind: 'turn_start',
 			expertId: 'synthesis',
@@ -284,6 +272,7 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 			turnNumber,
 			totalRounds: rounds
 		};
+		const synthesisPool = expertContexts.flatMap((c) => c.chunkPool);
 		const synthSys = buildModeratorSynthesisPrompt(opts.question, fullTranscript);
 		let synthContent = '';
 		let synthThinking = '';
@@ -305,7 +294,9 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 				yield ev;
 			}
 		}
-		const synthCitations = deriveCitations(synthContent);
+		synthContent = sanitizeModelOutput(synthContent);
+		const synthCitedIds = deriveCitationIds(synthContent);
+		const synthCitations = materializeCitations(synthCitedIds, synthesisPool);
 		await persistTurn({
 			chatId,
 			role: 'synthesis',
@@ -325,7 +316,12 @@ export async function* runRoundtable(opts: RunRoundtableOptions): AsyncGenerator
 
 		yield { kind: 'session_complete', chatId };
 	} catch (err) {
-		yield { kind: 'error', message: err instanceof Error ? err.message : String(err) };
+		// Log the real error server-side; send something safe to the browser.
+		console.error('[runRoundtable]', err);
+		yield {
+			kind: 'error',
+			message: 'The roundtable hit an error. Check server logs or try again.'
+		};
 	}
 }
 
@@ -341,9 +337,6 @@ async function* streamExpert(
 			{ role: 'user', content: userPrompt }
 		],
 		temperature: 0.75,
-		// Headroom for kimi-k2.6's reasoning (~2.5K tokens of thinking) + a single
-		// paragraph of content (~250 tokens). Empirical floor: ~3000 was too tight
-		// on edge cases.
 		maxTokens: 4500,
 		think: true
 	});
