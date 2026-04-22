@@ -5,15 +5,25 @@
 	import { modelStore } from '$lib/stores/model.svelte';
 	import { createFrameBatcher } from '$lib/stream-batch';
 	import { invalidate } from '$app/navigation';
+	import { page } from '$app/state';
 
-	let question = $state('');
+	let question = $state(page.url.searchParams.get('prefill') ?? '');
 	let rounds = $state(3);
 	let phase: 'idle' | 'selecting' | 'reviewing' | 'streaming' | 'done' = $state('idle');
 	let experts: ExpertCardData[] = $state([]);
 	let turns: TurnState[] = $state([]);
 	let errorMsg = $state('');
 	let abortController: AbortController | null = $state(null);
+	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	const avatarById = $derived(new Map(experts.map((e) => [e.expert_id, e.avatar_url])));
+
+	// Pretty labels for the rounds slider so users don't guess what "3" means.
+	const ROUND_LABELS: Record<number, string> = {
+		2: 'Quick take (≈1 min)',
+		3: 'Standard (≈2 min)',
+		4: 'Deep (≈3 min)',
+		5: 'Thorough (≈4 min)'
+	};
 
 	const EXAMPLES = [
 		'How do I price my B2B SaaS entering a competitive market?',
@@ -23,8 +33,14 @@
 	];
 
 	function stopStream() {
+		try {
+			reader?.cancel();
+		} catch {
+			/* ignore */
+		}
 		abortController?.abort();
 		abortController = null;
+		reader = null;
 		phase = 'done';
 	}
 
@@ -81,7 +97,7 @@
 			phase = 'reviewing';
 			return;
 		}
-		const reader = res.body.getReader();
+		reader = res.body.getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
 		const batch = createFrameBatcher();
@@ -104,67 +120,85 @@
 			pendingContent = '';
 		};
 
-		while (true) {
-			const { value, done } = await reader.read();
-			if (done) {
-				flushDeltas();
-				break;
+		try {
+			while (true) {
+				const { value, done } = await reader.read();
+				if (done) {
+					flushDeltas();
+					break;
+				}
+				buffer += decoder.decode(value, { stream: true });
+				let nl: number;
+				while ((nl = buffer.indexOf('\n\n')) !== -1) {
+					const block = buffer.slice(0, nl);
+					buffer = buffer.slice(nl + 2);
+					if (block.startsWith(':')) continue; // heartbeat
+					const lines = block.split('\n');
+					let eventName = 'message';
+					let dataStr = '';
+					for (const line of lines) {
+						if (line.startsWith('event: ')) eventName = line.slice(7).trim();
+						else if (line.startsWith('data: ')) dataStr += line.slice(6);
+					}
+					if (!dataStr) continue;
+					let payload: Record<string, unknown>;
+					try {
+						payload = JSON.parse(dataStr);
+					} catch {
+						continue;
+					}
+					if (eventName === 'chat_created') {
+						invalidate('app:chats');
+					} else if (eventName === 'turn_start') {
+						flushDeltas();
+						const newTurn: TurnState = {
+							expertId: String(payload.expertId),
+							expertName: String(payload.expertName),
+							role: payload.role as TurnState['role'],
+							round: Number(payload.round),
+							turnNumber: Number(payload.turnNumber),
+							thinking: '',
+							content: '',
+							done: false,
+							citations: []
+						};
+						turns = [...turns, newTurn];
+					} else if (eventName === 'thinking') {
+						pendingThinking += String(payload.delta);
+						batch(flushDeltas);
+					} else if (eventName === 'content') {
+						pendingContent += String(payload.delta);
+						batch(flushDeltas);
+					} else if (eventName === 'turn_end' && turns.length > 0) {
+						flushDeltas();
+						const i = turns.length - 1;
+						turns[i] = {
+							...turns[i],
+							done: true,
+							citations: (payload.citations as TurnState['citations']) ?? []
+						};
+					} else if (eventName === 'error') {
+						errorMsg = String(payload.message);
+						phase = 'done';
+					} else if (eventName === 'done' || eventName === 'session_complete') {
+						flushDeltas();
+						phase = 'done';
+						invalidate('app:chats');
+					}
+				}
 			}
-			buffer += decoder.decode(value, { stream: true });
-			let nl: number;
-			while ((nl = buffer.indexOf('\n\n')) !== -1) {
-				const block = buffer.slice(0, nl);
-				buffer = buffer.slice(nl + 2);
-				const lines = block.split('\n');
-				let eventName = 'message';
-				let dataStr = '';
-				for (const line of lines) {
-					if (line.startsWith('event: ')) eventName = line.slice(7).trim();
-					else if (line.startsWith('data: ')) dataStr += line.slice(6);
-				}
-				if (!dataStr) continue;
-				let payload: any;
-				try {
-					payload = JSON.parse(dataStr);
-				} catch {
-					continue;
-				}
-				if (eventName === 'chat_created') {
-					// Refresh the sidebar so this chat appears immediately.
-					invalidate('app:chats');
-				} else if (eventName === 'turn_start') {
-					flushDeltas();
-					const newTurn: TurnState = {
-						expertId: payload.expertId,
-						expertName: payload.expertName,
-						role: payload.role,
-						round: payload.round,
-						turnNumber: payload.turnNumber,
-						thinking: '',
-						content: '',
-						done: false,
-						citations: []
-					};
-					turns = [...turns, newTurn];
-				} else if (eventName === 'thinking') {
-					pendingThinking += payload.delta;
-					batch(flushDeltas);
-				} else if (eventName === 'content') {
-					pendingContent += payload.delta;
-					batch(flushDeltas);
-				} else if (eventName === 'turn_end' && turns.length > 0) {
-					flushDeltas();
-					const i = turns.length - 1;
-					turns[i] = { ...turns[i], done: true, citations: payload.citations ?? [] };
-				} else if (eventName === 'error') {
-					errorMsg = payload.message;
-					phase = 'done';
-				} else if (eventName === 'done' || eventName === 'session_complete') {
-					flushDeltas();
-					phase = 'done';
-					invalidate('app:chats');
-				}
+		} catch (err) {
+			if ((err as Error).name !== 'AbortError') {
+				errorMsg = 'Connection dropped. Try again.';
+				phase = 'done';
 			}
+		} finally {
+			try {
+				reader?.cancel();
+			} catch {
+				/* ignore */
+			}
+			reader = null;
 		}
 	}
 
@@ -252,14 +286,15 @@
 
 			<div class="flex items-center justify-between gap-3">
 				<label class="flex items-center gap-2 font-mono text-[11px] text-[var(--color-text-muted)]">
-					rounds:
+					depth:
 					<select
 						bind:value={rounds}
 						class="rounded border border-[var(--color-line-2)] bg-[var(--color-panel)] px-2 py-0.5 text-[var(--color-text)] focus:border-[var(--color-accent)] focus:outline-none"
 					>
-						<option value={3}>3</option>
-						<option value={4}>4</option>
-						<option value={5}>5</option>
+						<option value={2}>{ROUND_LABELS[2]}</option>
+						<option value={3}>{ROUND_LABELS[3]}</option>
+						<option value={4}>{ROUND_LABELS[4]}</option>
+						<option value={5}>{ROUND_LABELS[5]}</option>
 					</select>
 				</label>
 				<div class="flex items-center gap-3">

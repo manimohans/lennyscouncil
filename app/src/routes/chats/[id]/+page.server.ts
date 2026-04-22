@@ -3,7 +3,6 @@ import type { PageServerLoad } from './$types';
 import { sql } from '$lib/server/db';
 
 export const load: PageServerLoad = async ({ params, locals, depends }) => {
-	// Re-runnable from the client (e.g. after a continuation message arrives).
 	depends(`app:chat:${params.id}`);
 
 	const chatRows = (await sql`
@@ -17,7 +16,7 @@ export const load: PageServerLoad = async ({ params, locals, depends }) => {
 		mode: string;
 		created_at: string;
 		last_active_at: string;
-		metadata: { expert_id?: string } | null;
+		metadata: Record<string, unknown> | null;
 	}>;
 	if (chatRows.length === 0) throw error(404, 'Chat not found');
 	const chat = chatRows[0];
@@ -47,17 +46,23 @@ export const load: PageServerLoad = async ({ params, locals, depends }) => {
 		messageIds.length === 0
 			? []
 			: ((await sql`
-					SELECT c.message_id, c.chunk_id, c.quote, c.timestamp_str, ch.speaker, ch.title
+					SELECT c.message_id, c.chunk_id, c.timestamp_str, c.source_url,
+					       COALESCE(c.speaker,    ch.speaker) AS speaker,
+					       COALESCE(c.title,      ch.title)   AS title,
+					       COALESCE(c.cited_date, ch.date)    AS date,
+					       COALESCE(c.source_url, ch.source_url) AS resolved_url
 					FROM citations c
-					JOIN chunks ch ON ch.id = c.chunk_id
+					LEFT JOIN chunks ch ON ch.id = c.chunk_id
 					WHERE c.message_id = ANY(${messageIds})
 				`) as unknown as Array<{
 					message_id: string;
 					chunk_id: string;
-					quote: string;
 					timestamp_str: string | null;
-					speaker: string;
-					title: string;
+					source_url: string | null;
+					resolved_url: string | null;
+					speaker: string | null;
+					title: string | null;
+					date: string | Date | null;
 				}>);
 
 	const citesByMsg = new Map<string, typeof citations>();
@@ -67,23 +72,40 @@ export const load: PageServerLoad = async ({ params, locals, depends }) => {
 		citesByMsg.set(c.message_id, arr);
 	}
 
-	// For mentor / strategy chats, look up the expert_slug we'll need to continue
-	// the conversation (the chat's metadata stores the expert_id).
-	let continuationExpertSlug: string | null = null;
-	let continuationExpertName: string | null = null;
-	let continuationExpertAvatar: string | null = null;
+	// Build a continuation block for every supported mode. We always include
+	// enough context so the chat detail page can re-submit into the right
+	// stream endpoint without having to re-derive anything.
+	interface Continuation {
+		kind: 'mentor' | 'strategy' | 'roundtable' | 'validate' | 'prd';
+		expertSlug?: string;
+		expertName?: string;
+		expertAvatar?: string | null;
+		prevQuestion?: string;
+		prevArtifact?: string;
+	}
+
+	let continuation: Continuation | null = null;
 	if (chat.mode === 'mentor' || chat.mode === 'strategy') {
-		const expertId = chat.metadata?.expert_id;
+		const expertId = (chat.metadata as { expert_id?: string })?.expert_id;
 		if (expertId) {
 			const rows = (await sql`
 				SELECT slug, name, avatar_url FROM experts WHERE id = ${expertId} LIMIT 1
 			`) as unknown as Array<{ slug: string; name: string; avatar_url: string | null }>;
 			if (rows[0]) {
-				continuationExpertSlug = rows[0].slug;
-				continuationExpertName = rows[0].name;
-				continuationExpertAvatar = rows[0].avatar_url;
+				continuation = {
+					kind: chat.mode,
+					expertSlug: rows[0].slug,
+					expertName: rows[0].name,
+					expertAvatar: rows[0].avatar_url
+				};
 			}
 		}
+	} else if (chat.mode === 'roundtable') {
+		const prev = (chat.metadata as { question?: string })?.question;
+		continuation = { kind: 'roundtable', prevQuestion: prev };
+	} else if (chat.mode === 'validate' || chat.mode === 'prd') {
+		const prev = (chat.metadata as { artifact?: string })?.artifact;
+		continuation = { kind: chat.mode, prevArtifact: prev };
 	}
 
 	return {
@@ -95,17 +117,14 @@ export const load: PageServerLoad = async ({ params, locals, depends }) => {
 		messages: messages.map((m) => ({
 			...m,
 			citations: (citesByMsg.get(m.id) ?? []).map((c) => ({
-				...c,
-				chunk_id: Number(c.chunk_id)
+				chunk_id: Number(c.chunk_id),
+				source_url: c.resolved_url ?? c.source_url ?? null,
+				speaker: c.speaker ?? null,
+				title: c.title ?? null,
+				date: c.date ? String(c.date).slice(0, 10) : null,
+				timestamp_str: c.timestamp_str ?? null
 			}))
 		})),
-		continuation: continuationExpertSlug
-			? {
-					mode: chat.mode as 'mentor' | 'strategy',
-					expertSlug: continuationExpertSlug,
-					expertName: continuationExpertName!,
-					expertAvatar: continuationExpertAvatar
-				}
-			: null
+		continuation
 	};
 };

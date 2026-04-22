@@ -1,17 +1,22 @@
 <script lang="ts">
 	import { modelStore } from '$lib/stores/model.svelte';
 	import ThinkingDisclosure from '$lib/components/ThinkingDisclosure.svelte';
+	import { goto } from '$app/navigation';
+	import { onDestroy } from 'svelte';
 
 	interface Gap {
 		problem: string;
 		rationale: string;
 		signals: number;
+		recency_score: number;
 		supporting: Array<{
 			chunk_id: number;
 			quote: string;
 			speaker: string;
 			title: string;
 			date: string;
+			source_url: string | null;
+			timestamp_str: string | null;
 		}>;
 	}
 
@@ -22,6 +27,7 @@
 	let chunkCount = $state(0);
 	let thinking = $state('');
 	let errorMsg = $state('');
+	let abortController: AbortController | null = null;
 
 	const SUGGESTED = [
 		'B2B SaaS pricing',
@@ -33,20 +39,29 @@
 
 	const isThinking = $derived(phase === 'searching' || phase === 'searched' || phase === 'thinking');
 
-	async function scan() {
-		if (!topic.trim()) return;
+	async function scan(explicitTopic?: string) {
+		const t = (explicitTopic ?? topic).trim();
+		if (!t) return;
+		// Ensure the input box reflects what we're scanning, even when the user
+		// clicks a suggested-topic chip (Svelte 5 state updates are batched,
+		// so we read from `t` above instead of trusting the bound `topic`).
+		topic = t;
+
 		loading = true;
 		errorMsg = '';
 		gaps = [];
 		thinking = '';
 		chunkCount = 0;
 		phase = 'searching';
+		abortController?.abort();
+		abortController = new AbortController();
 
 		try {
 			const res = await fetch('/api/gaps/scan', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ topic, model: modelStore.value })
+				body: JSON.stringify({ topic: t, model: modelStore.value }),
+				signal: abortController.signal
 			});
 			if (!res.ok || !res.body) {
 				errorMsg = `Scan failed: ${res.status}`;
@@ -64,6 +79,7 @@
 				while ((nl = buffer.indexOf('\n\n')) !== -1) {
 					const block = buffer.slice(0, nl);
 					buffer = buffer.slice(nl + 2);
+					if (block.startsWith(':')) continue; // heartbeat
 					const lines = block.split('\n');
 					let eventName = 'message';
 					let dataStr = '';
@@ -72,37 +88,75 @@
 						else if (l.startsWith('data: ')) dataStr += l.slice(6);
 					}
 					if (!dataStr) continue;
-					let payload: any;
+					let payload: Record<string, unknown>;
 					try {
 						payload = JSON.parse(dataStr);
 					} catch {
 						continue;
 					}
 					if (eventName === 'searched') {
-						chunkCount = payload.chunk_count;
+						chunkCount = Number(payload.chunk_count);
 						phase = 'searched';
 					} else if (eventName === 'thinking') {
-						thinking += payload.delta;
+						thinking += String(payload.delta);
 						phase = 'thinking';
 					} else if (eventName === 'content') {
 						phase = 'streaming';
 					} else if (eventName === 'gaps') {
-						gaps = payload.gaps;
+						gaps = payload.gaps as Gap[];
 						if (gaps.length === 0) errorMsg = 'No clear gaps surfaced. Try a more specific topic.';
 					} else if (eventName === 'done') {
 						phase = 'done';
 					} else if (eventName === 'error') {
-						errorMsg = payload.message;
+						errorMsg = String(payload.message);
 						phase = 'done';
 					}
 				}
 			}
 		} catch (err) {
-			errorMsg = err instanceof Error ? err.message : String(err);
+			if ((err as Error).name !== 'AbortError') {
+				errorMsg = 'Connection dropped. Try again.';
+			}
 		} finally {
 			loading = false;
+			abortController = null;
 		}
 	}
+
+	function stop() {
+		abortController?.abort();
+	}
+
+	function validateGap(g: Gap) {
+		// Hand the gap off to the Validate flow as a pre-filled artifact.
+		const pieces = [
+			`Idea seed from the Gap scanner (topic: ${topic}):`,
+			'',
+			g.problem,
+			'',
+			g.rationale,
+			'',
+			'Selected supporting quotes from Lenny\'s corpus:',
+			...g.supporting.slice(0, 3).map((s) => `- "${s.quote}" — ${s.speaker}, ${s.title} (${s.date})`)
+		];
+		const artifact = pieces.join('\n');
+		const url = `/validate?prefill=${encodeURIComponent(artifact)}`;
+		goto(url);
+	}
+
+	function recencyLabel(score: number): string {
+		if (score >= 0.6) return 'fresh';
+		if (score >= 0.3) return 'mixed';
+		return 'old';
+	}
+
+	function recencyTone(score: number): string {
+		if (score >= 0.6) return 'text-emerald-400';
+		if (score >= 0.3) return 'text-amber-400';
+		return 'text-[var(--color-text-faint)]';
+	}
+
+	onDestroy(() => stop());
 </script>
 
 <div class="container-tight py-10">
@@ -130,13 +184,10 @@
 		/>
 		<div class="mt-3 flex flex-wrap items-center gap-2">
 			<span class="font-mono text-[11px] text-[var(--color-text-faint)]">try:</span>
-			{#each SUGGESTED as s}
+			{#each SUGGESTED as s (s)}
 				<button
 					type="button"
-					onclick={() => {
-						topic = s;
-						scan();
-					}}
+					onclick={() => scan(s)}
 					class="rounded border border-[var(--color-line)] bg-[var(--color-panel)] px-2 py-0.5 font-mono text-[11px] text-[var(--color-text-muted)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent-hi)]"
 				>
 					{s}
@@ -154,17 +205,26 @@
 
 	{#if phase !== 'idle' && phase !== 'done'}
 		<div class="mt-5 rounded-md border border-[var(--color-line)] bg-[var(--color-panel)] p-3">
-			<div class="flex items-center gap-2 font-mono text-[11px] text-[var(--color-text-muted)]">
-				<span class="dot-pulse"></span>
-				{#if phase === 'searching'}
-					searching corpus for complaint patterns…
-				{:else if phase === 'searched'}
-					found {chunkCount} candidate chunks · waiting for model to start…
-				{:else if phase === 'thinking'}
-					reasoning over {chunkCount} chunks…
-				{:else if phase === 'streaming'}
-					assembling gaps…
-				{/if}
+			<div class="flex items-center justify-between gap-2">
+				<div class="flex items-center gap-2 font-mono text-[11px] text-[var(--color-text-muted)]">
+					<span class="dot-pulse"></span>
+					{#if phase === 'searching'}
+						searching corpus for complaint patterns…
+					{:else if phase === 'searched'}
+						found {chunkCount} candidate chunks · waiting for model to start…
+					{:else if phase === 'thinking'}
+						reasoning over {chunkCount} chunks…
+					{:else if phase === 'streaming'}
+						assembling gaps…
+					{/if}
+				</div>
+				<button
+					type="button"
+					onclick={stop}
+					class="rounded border border-[var(--color-line)] px-2 py-0.5 font-mono text-[10px] text-[var(--color-text-faint)] hover:border-[var(--color-bad)] hover:text-[var(--color-bad)]"
+				>
+					stop
+				</button>
 			</div>
 			<ThinkingDisclosure {thinking} {isThinking} />
 		</div>
@@ -180,7 +240,7 @@
 
 	{#if gaps.length > 0}
 		<div class="mt-6 space-y-2">
-			{#each gaps as g, i (i)}
+			{#each gaps as g, i (g.problem)}
 				<article
 					class="rounded-md border border-[var(--color-line)] bg-[var(--color-panel)] p-4 transition-colors hover:border-[var(--color-line-2)]"
 				>
@@ -191,7 +251,10 @@
 							>
 							<h3 class="text-[14px] font-medium text-[var(--color-text)]">{g.problem}</h3>
 						</div>
-						<span class="tag shrink-0 text-[var(--color-accent-hi)]">{g.signals} signals</span>
+						<div class="flex shrink-0 items-center gap-2">
+							<span class="tag text-[var(--color-accent-hi)]">{g.signals} signals</span>
+							<span class="tag {recencyTone(g.recency_score)}">{recencyLabel(g.recency_score)}</span>
+						</div>
 					</div>
 					<p class="mt-2 ml-8 text-[13px] leading-relaxed text-[var(--color-text-muted)]">
 						{g.rationale}
@@ -201,22 +264,43 @@
 							<summary
 								class="cursor-pointer font-mono text-[11px] text-[var(--color-text-faint)] hover:text-[var(--color-accent-hi)]"
 							>
-								view supporting quotes
+								view supporting quotes ({g.supporting.length})
 							</summary>
 							<div class="mt-2 space-y-2">
-								{#each g.supporting as s}
+								{#each g.supporting as s (s.chunk_id)}
 									<blockquote
 										class="border-l border-[var(--color-line-2)] pl-2 text-[12px] text-[var(--color-text-muted)]"
 									>
 										"{s.quote}"
 										<footer class="mt-1 font-mono text-[10px] text-[var(--color-text-faint)]">
-											— {s.speaker} · {s.title} · {s.date}
+											— {s.speaker} ·
+											{#if s.source_url}
+												<a
+													href={s.source_url}
+													target="_blank"
+													rel="noopener noreferrer"
+													class="underline hover:text-[var(--color-accent-hi)]"
+													>{s.title}</a
+												>
+											{:else}
+												{s.title}
+											{/if}
+											· {s.date}{#if s.timestamp_str} @ {s.timestamp_str}{/if}
 										</footer>
 									</blockquote>
 								{/each}
 							</div>
 						</details>
 					{/if}
+					<div class="mt-3 ml-8 flex justify-end">
+						<button
+							type="button"
+							onclick={() => validateGap(g)}
+							class="rounded-md border border-[var(--color-line)] bg-[var(--color-panel-2)] px-2.5 py-1 font-mono text-[11px] text-[var(--color-text-muted)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent-hi)]"
+						>
+							› validate this idea →
+						</button>
+					</div>
 				</article>
 			{/each}
 		</div>
