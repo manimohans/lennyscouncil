@@ -4,26 +4,36 @@
 	import { modelStore } from '$lib/stores/model.svelte';
 	import { createFrameBatcher } from '$lib/stream-batch';
 	import { invalidate } from '$app/navigation';
+	import { onDestroy } from 'svelte';
 
 	let {
 		mode,
 		title,
 		cmd,
 		placeholder,
-		minChars = 20
+		minChars = 20,
+		prefillArtifact = ''
 	}: {
 		mode: 'validate' | 'prd';
 		title: string;
 		cmd: string;
 		placeholder: string;
 		minChars?: number;
+		prefillArtifact?: string;
 	} = $props();
 
+	// Seed from the query-string prefill once. The user then owns this state.
+	// eslint-disable-next-line svelte/prefer-const
 	let artifact = $state('');
+	$effect(() => {
+		if (prefillArtifact && !artifact) artifact = prefillArtifact;
+	});
 	let phase: 'idle' | 'streaming' | 'done' = $state('idle');
 	let experts: ExpertCardData[] = $state([]);
 	let turns: TurnState[] = $state([]);
 	let errorMsg = $state('');
+	let abortController: AbortController | null = null;
+	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	const avatarById = $derived(new Map(experts.map((e) => [e.expert_id, e.avatar_url])));
 
 	function initialsOf(name: string) {
@@ -41,108 +51,140 @@
 		experts = [];
 		turns = [];
 		errorMsg = '';
+		abortController = new AbortController();
 
-		const res = await fetch('/api/panel/stream', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ mode, artifact, model: modelStore.value })
-		});
-		if (!res.ok || !res.body) {
-			errorMsg = `Stream failed: ${res.status}`;
-			phase = 'idle';
-			return;
-		}
-		const reader = res.body.getReader();
-		const decoder = new TextDecoder();
-		let buffer = '';
-		const batch = createFrameBatcher();
-		let pendingThinking = '';
-		let pendingContent = '';
-		const flushDeltas = () => {
-			if (turns.length === 0) return;
-			if (!pendingThinking && !pendingContent) return;
-			const i = turns.length - 1;
-			turns[i] = {
-				...turns[i],
-				thinking: turns[i].thinking + pendingThinking,
-				content: turns[i].content + pendingContent
+		try {
+			const res = await fetch('/api/panel/stream', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ mode, artifact, model: modelStore.value }),
+				signal: abortController.signal
+			});
+			if (!res.ok || !res.body) {
+				errorMsg = `Stream failed: ${res.status}`;
+				phase = 'idle';
+				return;
+			}
+			reader = res.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			const batch = createFrameBatcher();
+			let pendingThinking = '';
+			let pendingContent = '';
+			const flushDeltas = () => {
+				if (turns.length === 0) return;
+				if (!pendingThinking && !pendingContent) return;
+				const i = turns.length - 1;
+				turns[i] = {
+					...turns[i],
+					thinking: turns[i].thinking + pendingThinking,
+					content: turns[i].content + pendingContent
+				};
+				pendingThinking = '';
+				pendingContent = '';
 			};
-			pendingThinking = '';
-			pendingContent = '';
-		};
 
-		while (true) {
-			const { value, done } = await reader.read();
-			if (done) {
-				flushDeltas();
-				break;
+			while (true) {
+				const { value, done } = await reader.read();
+				if (done) {
+					flushDeltas();
+					break;
+				}
+				buffer += decoder.decode(value, { stream: true });
+				let nl: number;
+				while ((nl = buffer.indexOf('\n\n')) !== -1) {
+					const block = buffer.slice(0, nl);
+					buffer = buffer.slice(nl + 2);
+					// Skip SSE comments (heartbeats)
+					if (block.startsWith(':')) continue;
+					const lines = block.split('\n');
+					let eventName = 'message';
+					let dataStr = '';
+					for (const line of lines) {
+						if (line.startsWith('event: ')) eventName = line.slice(7).trim();
+						else if (line.startsWith('data: ')) dataStr += line.slice(6);
+					}
+					if (!dataStr) continue;
+					let payload: Record<string, unknown>;
+					try {
+						payload = JSON.parse(dataStr);
+					} catch {
+						continue;
+					}
+					if (eventName === 'chat_created') {
+						invalidate('app:chats');
+					} else if (eventName === 'experts_selected') {
+						experts = payload.experts as ExpertCardData[];
+					} else if (eventName === 'turn_start') {
+						flushDeltas();
+						const newTurn: TurnState = {
+							expertId: String(payload.expertId),
+							expertName: String(payload.expertName),
+							role: payload.role as 'expert' | 'synthesis',
+							round: 1,
+							turnNumber: Number(payload.turnNumber),
+							thinking: '',
+							content: '',
+							done: false,
+							citations: []
+						};
+						turns = [...turns, newTurn];
+					} else if (eventName === 'thinking') {
+						pendingThinking += String(payload.delta);
+						batch(flushDeltas);
+					} else if (eventName === 'content') {
+						pendingContent += String(payload.delta);
+						batch(flushDeltas);
+					} else if (eventName === 'turn_end' && turns.length > 0) {
+						flushDeltas();
+						const i = turns.length - 1;
+						turns[i] = {
+							...turns[i],
+							done: true,
+							citations: (payload.citations as TurnState['citations']) ?? [],
+							scorecard: (payload.scorecard as TurnState['scorecard']) ?? null
+						};
+					} else if (eventName === 'error') {
+						errorMsg = String(payload.message);
+						phase = 'done';
+					} else if (eventName === 'done' || eventName === 'session_complete') {
+						flushDeltas();
+						phase = 'done';
+						invalidate('app:chats');
+					}
+				}
 			}
-			buffer += decoder.decode(value, { stream: true });
-			let nl: number;
-			while ((nl = buffer.indexOf('\n\n')) !== -1) {
-				const block = buffer.slice(0, nl);
-				buffer = buffer.slice(nl + 2);
-				const lines = block.split('\n');
-				let eventName = 'message';
-				let dataStr = '';
-				for (const line of lines) {
-					if (line.startsWith('event: ')) eventName = line.slice(7).trim();
-					else if (line.startsWith('data: ')) dataStr += line.slice(6);
-				}
-				if (!dataStr) continue;
-				let payload: any;
-				try {
-					payload = JSON.parse(dataStr);
-				} catch {
-					continue;
-				}
-				if (eventName === 'chat_created') {
-					invalidate('app:chats');
-				} else if (eventName === 'experts_selected') {
-					experts = payload.experts;
-				} else if (eventName === 'turn_start') {
-					flushDeltas();
-					const newTurn: TurnState = {
-						expertId: payload.expertId,
-						expertName: payload.expertName,
-						role: payload.role,
-						round: 1,
-						turnNumber: payload.turnNumber,
-						thinking: '',
-						content: '',
-						done: false,
-						citations: []
-					};
-					turns = [...turns, newTurn];
-				} else if (eventName === 'thinking') {
-					pendingThinking += payload.delta;
-					batch(flushDeltas);
-				} else if (eventName === 'content') {
-					pendingContent += payload.delta;
-					batch(flushDeltas);
-				} else if (eventName === 'turn_end' && turns.length > 0) {
-					flushDeltas();
-					const i = turns.length - 1;
-					turns[i] = { ...turns[i], done: true, citations: payload.citations ?? [] };
-				} else if (eventName === 'error') {
-					errorMsg = payload.message;
-					phase = 'done';
-				} else if (eventName === 'done' || eventName === 'session_complete') {
-					flushDeltas();
-					phase = 'done';
-					invalidate('app:chats');
-				}
+		} catch (err) {
+			// AbortError is expected when the user navigates away / stops the stream.
+			if ((err as Error).name !== 'AbortError') {
+				errorMsg = 'Connection dropped. Try again.';
+				phase = 'done';
 			}
+		} finally {
+			try {
+				reader?.cancel();
+			} catch {
+				/* ignore */
+			}
+			reader = null;
+			abortController = null;
 		}
 	}
 
+	function stop() {
+		if (abortController) abortController.abort();
+	}
+
 	function reset() {
+		stop();
 		phase = 'idle';
 		artifact = '';
 		experts = [];
 		turns = [];
 		errorMsg = '';
 	}
+
+	onDestroy(() => stop());
 </script>
 
 <div class="container-tight py-10">
@@ -184,22 +226,33 @@
 	{#if phase === 'streaming' || phase === 'done'}
 		<div>
 			{#if experts.length > 0}
-				<div class="mb-5">
-					<div class="section-label mb-2">reviewers</div>
-					<div class="flex flex-wrap gap-2">
-						{#each experts as e}
-							<div
-								class="flex items-center gap-2 rounded-md border border-[var(--color-line)] bg-[var(--color-panel)] px-2 py-1 font-mono text-[11px] text-[var(--color-text-muted)]"
-							>
-								{#if e.avatar_url}
-									<img src={e.avatar_url} alt={e.name} class="h-4 w-4 rounded-sm" />
-								{:else}
-									<span class="font-mono text-[9px]">{initialsOf(e.name)}</span>
-								{/if}
-								<span class="text-[var(--color-text)]">{e.name}</span>
-							</div>
-						{/each}
+				<div class="mb-5 flex items-center justify-between gap-3">
+					<div class="flex-1">
+						<div class="section-label mb-2">reviewers</div>
+						<div class="flex flex-wrap gap-2">
+							{#each experts as e (e.expert_id)}
+								<div
+									class="flex items-center gap-2 rounded-md border border-[var(--color-line)] bg-[var(--color-panel)] px-2 py-1 font-mono text-[11px] text-[var(--color-text-muted)]"
+								>
+									{#if e.avatar_url}
+										<img src={e.avatar_url} alt={e.name} class="h-4 w-4 rounded-sm" />
+									{:else}
+										<span class="font-mono text-[9px]">{initialsOf(e.name)}</span>
+									{/if}
+									<span class="text-[var(--color-text)]">{e.name}</span>
+								</div>
+							{/each}
+						</div>
 					</div>
+					{#if phase === 'streaming'}
+						<button
+							type="button"
+							onclick={stop}
+							class="self-start rounded-md border border-[var(--color-line)] px-2.5 py-1 font-mono text-[11px] text-[var(--color-text-muted)] hover:border-[var(--color-bad)] hover:text-[var(--color-bad)]"
+						>
+							stop
+						</button>
+					{/if}
 				</div>
 			{/if}
 

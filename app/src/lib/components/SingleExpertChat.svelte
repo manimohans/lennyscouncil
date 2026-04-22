@@ -4,6 +4,8 @@
 	import ThinkingDisclosure from './ThinkingDisclosure.svelte';
 	import { createFrameBatcher } from '$lib/stream-batch';
 	import { invalidate } from '$app/navigation';
+	import { onDestroy } from 'svelte';
+	import type { CitationData } from '$lib/types';
 
 	let {
 		mode,
@@ -27,6 +29,7 @@
 		content: string;
 		thinking: string;
 		streaming: boolean;
+		citations: CitationData[];
 	}
 
 	let selectedSlug = $state('');
@@ -38,6 +41,8 @@
 	let draft = $state('');
 	let streaming = $state(false);
 	let errorMsg = $state('');
+	let abortController: AbortController | null = null;
+	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
 	const expertById = $derived(new Map(expertSuggestions.map((e) => [e.slug, e])));
 	const expert = $derived(expertById.get(selectedSlug));
@@ -53,96 +58,135 @@
 
 	async function send() {
 		if (!selectedSlug || !draft.trim() || streaming) return;
-		const userMsg: ChatMessage = { role: 'user', content: draft.trim(), thinking: '', streaming: false };
+		const userMsg: ChatMessage = {
+			role: 'user',
+			content: draft.trim(),
+			thinking: '',
+			streaming: false,
+			citations: []
+		};
 		history = [
 			...history,
 			userMsg,
-			{ role: 'expert', content: '', thinking: '', streaming: true }
+			{ role: 'expert', content: '', thinking: '', streaming: true, citations: [] }
 		];
 		const question = draft;
 		draft = '';
 		streaming = true;
 		errorMsg = '';
+		abortController = new AbortController();
 
-		const res = await fetch('/api/expert-chat/stream', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ mode, expertSlug: selectedSlug, question, chatId, model: modelStore.value })
-		});
-		if (!res.ok || !res.body) {
-			errorMsg = `Stream failed: ${res.status}`;
-			streaming = false;
-			return;
-		}
-		const reader = res.body.getReader();
-		const decoder = new TextDecoder();
-		let buffer = '';
-		const batch = createFrameBatcher();
-		let pendingThinking = '';
-		let pendingContent = '';
-		const flushDeltas = () => {
-			const i = history.length - 1;
-			if (i < 0 || history[i].role !== 'expert') return;
-			if (!pendingThinking && !pendingContent) return;
-			history[i] = {
-				...history[i],
-				thinking: history[i].thinking + pendingThinking,
-				content: history[i].content + pendingContent
+		try {
+			const res = await fetch('/api/expert-chat/stream', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					mode,
+					expertSlug: selectedSlug,
+					question,
+					chatId,
+					model: modelStore.value
+				}),
+				signal: abortController.signal
+			});
+			if (!res.ok || !res.body) {
+				errorMsg = `Stream failed: ${res.status}`;
+				streaming = false;
+				return;
+			}
+			reader = res.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			const batch = createFrameBatcher();
+			let pendingThinking = '';
+			let pendingContent = '';
+			const flushDeltas = () => {
+				const i = history.length - 1;
+				if (i < 0 || history[i].role !== 'expert') return;
+				if (!pendingThinking && !pendingContent) return;
+				history[i] = {
+					...history[i],
+					thinking: history[i].thinking + pendingThinking,
+					content: history[i].content + pendingContent
+				};
+				pendingThinking = '';
+				pendingContent = '';
 			};
-			pendingThinking = '';
-			pendingContent = '';
-		};
 
-		while (true) {
-			const { value, done } = await reader.read();
-			if (done) {
-				flushDeltas();
-				break;
-			}
-			buffer += decoder.decode(value, { stream: true });
-			let nl: number;
-			while ((nl = buffer.indexOf('\n\n')) !== -1) {
-				const block = buffer.slice(0, nl);
-				buffer = buffer.slice(nl + 2);
-				const lines = block.split('\n');
-				let eventName = 'message';
-				let dataStr = '';
-				for (const l of lines) {
-					if (l.startsWith('event: ')) eventName = l.slice(7).trim();
-					else if (l.startsWith('data: ')) dataStr += l.slice(6);
-				}
-				if (!dataStr) continue;
-				let payload: any;
-				try {
-					payload = JSON.parse(dataStr);
-				} catch {
-					continue;
-				}
-				if (eventName === 'chat_created') {
-					if (!chatId) chatId = payload.chatId;
-					invalidate('app:chats');
-				} else if (eventName === 'thinking') {
-					pendingThinking += payload.delta;
-					batch(flushDeltas);
-				} else if (eventName === 'content') {
-					pendingContent += payload.delta;
-					batch(flushDeltas);
-				} else if (eventName === 'turn_end') {
+			while (true) {
+				const { value, done } = await reader.read();
+				if (done) {
 					flushDeltas();
-					const i = history.length - 1;
-					if (i >= 0) {
-						history[i] = { ...history[i], streaming: false };
+					break;
+				}
+				buffer += decoder.decode(value, { stream: true });
+				let nl: number;
+				while ((nl = buffer.indexOf('\n\n')) !== -1) {
+					const block = buffer.slice(0, nl);
+					buffer = buffer.slice(nl + 2);
+					if (block.startsWith(':')) continue; // heartbeat
+					const lines = block.split('\n');
+					let eventName = 'message';
+					let dataStr = '';
+					for (const l of lines) {
+						if (l.startsWith('event: ')) eventName = l.slice(7).trim();
+						else if (l.startsWith('data: ')) dataStr += l.slice(6);
 					}
-				} else if (eventName === 'session_complete') {
-					if (!chatId) chatId = payload.chatId;
-					invalidate('app:chats');
-				} else if (eventName === 'error') {
-					errorMsg = payload.message;
+					if (!dataStr) continue;
+					let payload: Record<string, unknown>;
+					try {
+						payload = JSON.parse(dataStr);
+					} catch {
+						continue;
+					}
+					if (eventName === 'chat_created') {
+						if (!chatId) chatId = String(payload.chatId);
+						invalidate('app:chats');
+					} else if (eventName === 'thinking') {
+						pendingThinking += String(payload.delta);
+						batch(flushDeltas);
+					} else if (eventName === 'content') {
+						pendingContent += String(payload.delta);
+						batch(flushDeltas);
+					} else if (eventName === 'turn_end') {
+						flushDeltas();
+						const i = history.length - 1;
+						if (i >= 0) {
+							history[i] = {
+								...history[i],
+								streaming: false,
+								citations: (payload.citations as CitationData[]) ?? []
+							};
+						}
+					} else if (eventName === 'session_complete') {
+						if (!chatId) chatId = String(payload.chatId);
+						invalidate('app:chats');
+					} else if (eventName === 'error') {
+						errorMsg = String(payload.message);
+					}
 				}
 			}
+		} catch (err) {
+			if ((err as Error).name !== 'AbortError') {
+				errorMsg = 'Connection dropped. Try again.';
+			}
+		} finally {
+			try {
+				reader?.cancel();
+			} catch {
+				/* ignore */
+			}
+			reader = null;
+			abortController = null;
+			streaming = false;
 		}
-		streaming = false;
 	}
+
+	function stop() {
+		if (abortController) abortController.abort();
+	}
+
+	onDestroy(() => stop());
 </script>
 
 <div class="container-tight py-10">
@@ -160,7 +204,7 @@
 			<div
 				class="grid gap-px overflow-hidden rounded-md border border-[var(--color-line)] bg-[var(--color-line)] sm:grid-cols-2"
 			>
-				{#each expertSuggestions as e}
+				{#each expertSuggestions as e (e.slug)}
 					<button
 						type="button"
 						onclick={() => (selectedSlug = e.slug)}
@@ -200,6 +244,7 @@
 			<div class="text-[13px] font-medium">talking to {expert?.name}</div>
 			<button
 				onclick={() => {
+					stop();
 					selectedSlug = '';
 					chatId = null;
 					history = [];
@@ -211,7 +256,7 @@
 		</div>
 
 		<div class="space-y-3">
-			{#each history as m, i (i)}
+			{#each history as m, i (`${m.role}-${i}`)}
 				{#if m.role === 'user'}
 					<div class="flex justify-end">
 						<div
@@ -231,7 +276,7 @@
 						/>
 						{#if m.content}
 							<div class="md">
-								{@html renderMarkdown(m.content)}{#if m.streaming}<span class="caret"></span>{/if}
+								{@html renderMarkdown(m.content, m.citations)}{#if m.streaming}<span class="caret"></span>{/if}
 							</div>
 						{/if}
 					</div>
@@ -266,7 +311,13 @@
 				}}
 				class="flex-1 rounded-md border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2 text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-faint)] focus:border-[var(--color-accent)] focus:outline-none"
 			></textarea>
-			<button type="submit" disabled={streaming || !draft.trim()} class="btn-primary">› send</button>
+			{#if streaming}
+				<button type="button" onclick={stop} class="rounded-md border border-[var(--color-line)] px-3 py-2 font-mono text-xs text-[var(--color-text-muted)] hover:border-[var(--color-bad)] hover:text-[var(--color-bad)]">
+					stop
+				</button>
+			{:else}
+				<button type="submit" disabled={!draft.trim()} class="btn-primary">› send</button>
+			{/if}
 		</form>
 	{/if}
 </div>

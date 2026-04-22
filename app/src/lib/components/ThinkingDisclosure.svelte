@@ -29,6 +29,8 @@
 
 	$effect(() => {
 		// Start timer the moment isThinking goes true (don't wait for first token).
+		// Reset startMs on each new thinking session so the second+ turns in a
+		// reused component instance count time correctly.
 		if (isThinking && !startMs) {
 			startMs = Date.now();
 			now = Date.now();
@@ -40,6 +42,13 @@
 			frozenSeconds = Math.max(1, Math.round((Date.now() - startMs) / 1000));
 			if (timerHandle) clearInterval(timerHandle);
 			timerHandle = null;
+		}
+		// When isThinking flips back to true for a NEW cycle, wipe state so the
+		// next run starts fresh (otherwise the old startMs prevents the timer
+		// from re-starting and `frozenSeconds` bleeds into the new run).
+		if (isThinking && frozenSeconds !== null) {
+			startMs = null;
+			frozenSeconds = null;
 		}
 	});
 

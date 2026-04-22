@@ -13,16 +13,22 @@ export interface ExpertCardData {
 		title: string;
 		date: string;
 		timestamp_str: string | null;
+		source_url?: string | null;
 	}>;
 	why_selected: string;
 }
 
 export interface CitationData {
 	chunk_id: number;
-	quote?: string;
-	title?: string;
-	speaker?: string;
+	/** Article URL (YouTube for podcasts, newsletter post URL for newsletters). */
+	source_url?: string | null;
+	/** Denormalised fields for hovercards — populated at citation write time. */
+	speaker?: string | null;
+	title?: string | null;
+	date?: string | null;
 	timestamp_str?: string | null;
+	/** Legacy: not rendered any more (we don't surface chunk quotes in the UI). */
+	quote?: string;
 }
 
 export interface TurnState {
@@ -35,4 +41,9 @@ export interface TurnState {
 	content: string;
 	done: boolean;
 	citations: CitationData[];
+	/** Only populated for validate-mode expert turns. */
+	scorecard?: {
+		axes: Array<{ name: string; score: number; note: string }>;
+		verdict_hint?: 'build' | 'sharpen' | 'kill';
+	} | null;
 }

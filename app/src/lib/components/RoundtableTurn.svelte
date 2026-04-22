@@ -2,12 +2,14 @@
 	import type { TurnState } from '$lib/types';
 	import { renderMarkdown } from '$lib/markdown';
 	import ThinkingDisclosure from './ThinkingDisclosure.svelte';
+	import ScorecardCard from './ScorecardCard.svelte';
 
 	let { turn, expertAvatar = null }: { turn: TurnState; expertAvatar?: string | null } = $props();
 
-	const html = $derived(renderMarkdown(turn.content));
-	// "Currently thinking" = turn started, no content yet, not done.
-	// (Show indicator immediately, even before the first thinking token arrives.)
+	// For validate mode we strip the raw <scorecard> JSON from the body so users
+	// see a clean critique. The scorecard itself renders as a visual component.
+	const visibleContent = $derived(turn.content.replace(/<scorecard>[\s\S]*?<\/scorecard>\s*/i, ''));
+	const html = $derived(renderMarkdown(visibleContent, turn.citations));
 	const isThinking = $derived(!turn.done && turn.content.length === 0);
 
 	const initials = $derived(
@@ -47,7 +49,11 @@
 
 	<ThinkingDisclosure thinking={turn.thinking} {isThinking} />
 
-	{#if turn.content}
+	{#if turn.scorecard}
+		<ScorecardCard scorecard={turn.scorecard} />
+	{/if}
+
+	{#if visibleContent}
 		<div class="md">
 			{@html html}{#if !turn.done}<span class="caret"></span>{/if}
 		</div>
