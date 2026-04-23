@@ -67,6 +67,38 @@ bun run dev
 # → http://localhost:5173
 ```
 
+## Serving on the LAN (WSL)
+
+`bun run dev` and `bun run preview` already bind to `0.0.0.0`, so the SvelteKit
+server listens on every interface inside WSL. Getting those requests to arrive
+from other devices on the network needs one of the following:
+
+**Option A — port forward from Windows (per-boot, admin UAC).**
+A ready-to-run script lives at `C:\Users\Mani\setup-lr-network.ps1`. It:
+1. Looks up the current WSL IP.
+2. `netsh portproxy`s Windows:5173 → WSL:5173.
+3. Opens a firewall rule for inbound TCP 5173.
+
+Right-click the `.ps1` → *Run with PowerShell* → accept UAC. It prints the LAN
+URLs when done. Re-run after every Windows reboot (or wrap it in a scheduled
+task triggered by *At startup*).
+
+**Option B — mirrored networking (one-time, then forever).**
+`C:\Users\Mani\.wslconfig` is already set up for this. Run `wsl --shutdown`
+once in PowerShell; WSL restarts with mirrored networking, and ports bound
+inside WSL appear directly on the Windows LAN IP. No port-forward, no admin.
+Caveat: `OLLAMA_BASE_URL` must switch from `172.23.224.1` to `localhost` in
+`.env.local` because mirrored mode collapses the WSL gateway into loopback.
+
+**Option C — Tailscale.** Zero-config, encrypted, identity-gated. Install in
+WSL, `tailscale up`, share the node. Best for sharing with someone not on
+your physical network.
+
+> **Auth caveat:** the app currently uses a single-user shim. Anyone who
+> reaches the URL *is* the user. Fine for a trusted LAN demo; put Caddy /
+> nginx basic-auth (or Supabase auth — tracked for the migration) in front
+> before a public-exposed deployment.
+
 ## Scripts
 
 | Command | Purpose |
